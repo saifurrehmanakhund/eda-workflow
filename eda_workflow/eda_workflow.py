@@ -220,26 +220,112 @@ def make_eda_baseline_workflow(
         }
     
     def compute_aggregates_node(state: EDAState):
-        """Compute group-by aggregates on key columns.
-        
-        TODO: Implement this analysis tool.
-        
-        See profile_dataset_node and analyze_missingness_node for reference.
-        Store your results in results["compute_aggregates"] and return
-        {"current_step": "compute_aggregates", "results": results}.
-        """
+        """Compute group-by aggregates on key columns."""
         logger.info("Computing aggregates")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+        
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        
+        aggregates = {}
+        
+        # Compute aggregates grouped by each categorical column
+        if categorical_cols and numeric_cols:
+            for cat_col in categorical_cols:
+                # Limit to top 10 categories to prevent token overflow
+                top_categories = df[cat_col].value_counts().head(10).index
+                df_subset = df[df[cat_col].isin(top_categories)]
+                
+                # Compute mean and count (exclude sum to reduce size)
+                agg_result = df_subset.groupby(cat_col)[numeric_cols].agg(['mean', 'count']).round(2).to_dict()
+                aggregates[cat_col] = {
+                    "top_10_categories": agg_result,
+                    "total_categories": df[cat_col].nunique(),
+                    "note": f"Showing top 10 out of {df[cat_col].nunique()} categories"
+                }
+        
+        results["compute_aggregates"] = aggregates if aggregates else {
+            "message": "No categorical and numeric columns available for aggregation"
+        }
+        
+        return {
+            "current_step": "compute_aggregates",
+            "results": results,
+        }
     
     def analyze_relationships_node(state: EDAState):
-        """Analyze relationships between variables.
-        
-        TODO: Implement this analysis tool.
-        
-        See profile_dataset_node and analyze_missingness_node for reference.
-        Store your results in results["analyze_relationships"] and return
-        {"current_step": "analyze_relationships", "results": results}.
-        """
+        """Analyze relationships between variables."""
         logger.info("Analyzing relationships")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+        
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        
+        relationships = {}
+        
+        # Compute correlation matrix for numeric columns
+        if len(numeric_cols) > 1:
+            correlation_matrix = df[numeric_cols].corr().round(3).to_dict()
+            relationships["numeric_correlations"] = correlation_matrix
+        
+        # Compute summary statistics for categorical relationships (limit to top 5 categories to reduce size)
+        if len(categorical_cols) > 1:
+            relationship_summary = {}
+            for i, col1 in enumerate(categorical_cols):
+                for col2 in categorical_cols[i+1:]:
+                    ct = pd.crosstab(df[col1], df[col2])
+                    # Store only shape and top values to prevent token overflow
+                    relationship_summary[f"{col1}_vs_{col2}"] = {
+                        "shape": list(ct.shape),
+                        "top_combinations": ct.stack().nlargest(5).to_dict(),
+                        "contingency_exists": True,
+                    }
+            relationships["categorical_relationships"] = relationship_summary if relationship_summary else {}
+        
+        results["analyze_relationships"] = relationships if relationships else {
+            "message": "Insufficient columns for relationship analysis"
+        }
+        
+        return {
+            "current_step": "analyze_relationships",
+            "results": results,
+        }
+    
+    def _truncate_for_llm(results: dict, max_items: int = 5, max_key_len: int = 1000) -> str:
+        """Serialize results for LLM, truncating large structures to prevent token overflow."""
+        import json
+        
+        def truncate_value(val, depth=0):
+            """Recursively truncate nested structures."""
+            if depth > 2:  # Limit nesting depth
+                return str(val)[:100]
+            
+            if isinstance(val, dict):
+                if len(val) > max_items:
+                    truncated = {k: v for i, (k, v) in enumerate(val.items()) if i < max_items}
+                    truncated[f"... and {len(val) - max_items} more"] = None
+                    return {k: truncate_value(v, depth + 1) for k, v in truncated.items()}
+                return {k: truncate_value(v, depth + 1) for k, v in val.items()}
+            
+            elif isinstance(val, (list, tuple)):
+                if len(val) > max_items:
+                    truncated = list(val)[:max_items]
+                    truncated.append(f"... and {len(val) - max_items} more items")
+                    return truncated
+                return [truncate_value(v, depth + 1) for v in val]
+            
+            elif isinstance(val, str):
+                return val[:max_key_len]
+            else:
+                return val
+        
+        truncated = truncate_value(results)
+        try:
+            return json.dumps(truncated, indent=2, default=str)
+        except:
+            return str(truncated)[:2000]  # Fallback to truncated string
     
     def extract_observations_node(state: EDAState):
         """Extract observations from the latest analysis results using LLM."""
@@ -265,7 +351,7 @@ def make_eda_baseline_workflow(
         chain = observation_prompt | model.with_structured_output(ObservationOutput)
         response = chain.invoke({
             "step_name": current_step.replace("_", " ").title(),
-            "results": str(step_results)
+            "results": _truncate_for_llm(step_results)
         })
         
         observations[current_step] = response.observations
