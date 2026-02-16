@@ -1,5 +1,8 @@
 # Context
-The following results are from the **{step_name}** step of an exploratory data analysis.
+You are analyzing the **{step_name}** step from an exploratory data analysis.
+
+# Task
+Return 1-2 concise, actionable observations based only on these results.
 
 # Results
 {results}

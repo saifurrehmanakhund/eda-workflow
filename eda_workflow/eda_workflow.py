@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from typing import Optional, TypedDict
 
@@ -218,6 +219,157 @@ def make_eda_baseline_workflow(
             "current_step": "analyze_missingness",
             "results": results,
         }
+
+    def detect_duplicates_node(state: EDAState):
+        """Detect duplicate records and data quality red flags."""
+        logger.info("Detecting duplicates")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+
+        total_rows = len(df)
+        duplicate_rows = df.duplicated().sum()
+        duplicate_pct = round((duplicate_rows / total_rows) * 100, 2) if total_rows else 0
+
+        id_columns = [col for col in df.columns if "id" in col.lower()]
+        duplicate_ids = {}
+        for col in id_columns:
+            if df[col].isnull().all():
+                continue
+            dup_count = df[col].duplicated().sum()
+            duplicate_ids[col] = {
+                "duplicate_count": int(dup_count),
+                "duplicate_pct": round((dup_count / total_rows) * 100, 2) if total_rows else 0,
+            }
+
+        red_flags = []
+        if duplicate_pct > 1:
+            red_flags.append("High duplicate row percentage (>1%)")
+        for col, stats in duplicate_ids.items():
+            if stats["duplicate_pct"] > 1:
+                red_flags.append(f"High duplicate IDs in {col} (>1%)")
+
+        duplicates = {
+            "total_rows": total_rows,
+            "duplicate_rows": int(duplicate_rows),
+            "duplicate_pct": duplicate_pct,
+            "duplicate_id_columns": duplicate_ids,
+            "red_flags": red_flags,
+        }
+
+        results["detect_duplicates"] = duplicates
+
+        return {
+            "current_step": "detect_duplicates",
+            "results": results,
+        }
+
+    def analyze_distributions_node(state: EDAState):
+        """Analyze numeric distributions with skewness, kurtosis, and normality tests."""
+        logger.info("Analyzing distributions")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        distributions = {}
+
+        for col in numeric_cols:
+            series = df[col].dropna()
+            n = len(series)
+            if n < 3:
+                distributions[col] = {
+                    "count": n,
+                    "note": "Insufficient data for distribution analysis",
+                }
+                continue
+
+            skewness = round(series.skew(), 4)
+            kurtosis = round(series.kurt(), 4)
+
+            # Jarque-Bera test (approx), chi-square df=2 => p = exp(-JB/2)
+            jb_stat = (n / 6.0) * (skewness ** 2 + (kurtosis ** 2) / 4.0)
+            jb_pvalue = round(math.exp(-jb_stat / 2.0), 6) if jb_stat >= 0 else 1.0
+
+            distributions[col] = {
+                "count": int(n),
+                "skewness": skewness,
+                "kurtosis": kurtosis,
+                "jarque_bera": {
+                    "statistic": round(jb_stat, 4),
+                    "p_value": jb_pvalue,
+                    "is_normal_approx": jb_pvalue >= 0.05,
+                },
+            }
+
+        results["analyze_distributions"] = distributions if distributions else {
+            "message": "No numeric columns available for distribution analysis"
+        }
+
+        return {
+            "current_step": "analyze_distributions",
+            "results": results,
+        }
+
+    def detect_outliers_node(state: EDAState):
+        """Detect outliers using IQR and z-score methods."""
+        logger.info("Detecting outliers")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        outliers = {}
+
+        for col in numeric_cols:
+            series = df[col].dropna()
+            n = len(series)
+            if n < 4:
+                outliers[col] = {
+                    "count": n,
+                    "note": "Insufficient data for outlier detection",
+                }
+                continue
+
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            iqr_mask = (series < lower) | (series > upper)
+            iqr_count = int(iqr_mask.sum())
+
+            std = series.std()
+            if std == 0 or pd.isna(std):
+                z_count = 0
+                z_sample = []
+            else:
+                z_scores = (series - series.mean()) / std
+                z_mask = z_scores.abs() > 3
+                z_count = int(z_mask.sum())
+                z_sample = series[z_mask].head(5).round(4).tolist()
+
+            outliers[col] = {
+                "count": int(n),
+                "iqr": {
+                    "lower_bound": round(lower, 4),
+                    "upper_bound": round(upper, 4),
+                    "outlier_count": iqr_count,
+                    "outlier_pct": round((iqr_count / n) * 100, 2) if n else 0,
+                },
+                "z_score": {
+                    "threshold": 3,
+                    "outlier_count": z_count,
+                    "outlier_pct": round((z_count / n) * 100, 2) if n else 0,
+                    "sample_values": z_sample,
+                },
+            }
+
+        results["detect_outliers"] = outliers if outliers else {
+            "message": "No numeric columns available for outlier detection"
+        }
+
+        return {
+            "current_step": "detect_outliers",
+            "results": results,
+        }
     
     def compute_aggregates_node(state: EDAState):
         """Compute group-by aggregates on key columns."""
@@ -403,10 +555,16 @@ def make_eda_baseline_workflow(
     workflow.add_node("extract_observations_1", extract_observations_node)
     workflow.add_node("analyze_missingness", analyze_missingness_node)
     workflow.add_node("extract_observations_2", extract_observations_node)
-    workflow.add_node("compute_aggregates", compute_aggregates_node)
+    workflow.add_node("detect_duplicates", detect_duplicates_node)
     workflow.add_node("extract_observations_3", extract_observations_node)
-    workflow.add_node("analyze_relationships", analyze_relationships_node)
+    workflow.add_node("analyze_distributions", analyze_distributions_node)
     workflow.add_node("extract_observations_4", extract_observations_node)
+    workflow.add_node("detect_outliers", detect_outliers_node)
+    workflow.add_node("extract_observations_5", extract_observations_node)
+    workflow.add_node("compute_aggregates", compute_aggregates_node)
+    workflow.add_node("extract_observations_6", extract_observations_node)
+    workflow.add_node("analyze_relationships", analyze_relationships_node)
+    workflow.add_node("extract_observations_7", extract_observations_node)
     workflow.add_node("synthesize_findings", synthesize_findings_node)
     
     workflow.set_entry_point("profile_dataset")
@@ -414,11 +572,17 @@ def make_eda_baseline_workflow(
     workflow.add_edge("profile_dataset", "extract_observations_1")
     workflow.add_edge("extract_observations_1", "analyze_missingness")
     workflow.add_edge("analyze_missingness", "extract_observations_2")
-    workflow.add_edge("extract_observations_2", "compute_aggregates")
-    workflow.add_edge("compute_aggregates", "extract_observations_3")
-    workflow.add_edge("extract_observations_3", "analyze_relationships")
-    workflow.add_edge("analyze_relationships", "extract_observations_4")
-    workflow.add_edge("extract_observations_4", "synthesize_findings")
+    workflow.add_edge("extract_observations_2", "detect_duplicates")
+    workflow.add_edge("detect_duplicates", "extract_observations_3")
+    workflow.add_edge("extract_observations_3", "analyze_distributions")
+    workflow.add_edge("analyze_distributions", "extract_observations_4")
+    workflow.add_edge("extract_observations_4", "detect_outliers")
+    workflow.add_edge("detect_outliers", "extract_observations_5")
+    workflow.add_edge("extract_observations_5", "compute_aggregates")
+    workflow.add_edge("compute_aggregates", "extract_observations_6")
+    workflow.add_edge("extract_observations_6", "analyze_relationships")
+    workflow.add_edge("analyze_relationships", "extract_observations_7")
+    workflow.add_edge("extract_observations_7", "synthesize_findings")
     workflow.add_edge("synthesize_findings", END)
     
     app = workflow.compile(checkpointer=checkpointer, name=WORKFLOW_NAME)
