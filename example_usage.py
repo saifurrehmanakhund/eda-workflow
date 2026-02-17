@@ -44,10 +44,13 @@ recommendations = workflow.get_recommendations()
 observations = workflow.get_observations()
 results = workflow.get_results()
 
-# Display results sequentially: tool result → observations → next tool
+# Display observations for each analysis step
 analysis_steps = [
     ("profile_dataset", "Dataset Profile"),
     ("analyze_missingness", "Missingness Analysis"),
+    ("detect_duplicates", "Duplicate Detection"),
+    ("analyze_distributions", "Distribution Analysis"),
+    ("detect_outliers", "Outlier Detection"),
     ("compute_aggregates", "Aggregates Analysis"),
     ("analyze_relationships", "Relationships Analysis"),
 ]
@@ -57,17 +60,7 @@ for step_key, step_title in analysis_steps:
     print(f"{step_title.upper()}")
     print("=" * 60)
     
-    # Show results
-    if step_key in results:
-        step_results = results[step_key]
-        for key, value in step_results.items():
-            if isinstance(value, dict) and len(str(value)) > 200:
-                print(f"{key}: {type(value).__name__} with {len(value)} items")
-            else:
-                print(f"{key}: {value}")
-    
-    # Show observations
-    print(f"\nObservations:")
+    # Show observations only
     if step_key in observations and observations[step_key]:
         for obs in observations[step_key]:
             print(f"  • {obs}")
